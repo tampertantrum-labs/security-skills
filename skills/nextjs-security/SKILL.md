@@ -9,7 +9,7 @@ Build secure Next.js applications with proper authentication, authorization, and
 
 ## When to Use This Skill
 
-- Building Next.js 13+ applications (App Router)
+- Building Next.js 16+ applications (App Router)
 - Implementing authentication/authorization
 - Creating API routes
 - Using Server Components and Server Actions
