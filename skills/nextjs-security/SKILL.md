@@ -96,6 +96,8 @@ export const getUserProjects = cache(async () => {
 
 ## Server Actions Security
 
+> **Server Actions are public HTTP endpoints.** Any function marked with `'use server'` becomes callable by anyone via POST request — even if it's only used in one form. Always authenticate and validate inside every Server Action. Next.js includes automatic CSRF protection (origin checking), but authorization is your responsibility.
+
 ### Always Validate Input
 
 ```tsx
@@ -127,7 +129,7 @@ export async function createPost(formData: FormData) {
 
   const result = createPostSchema.safeParse(rawData);
   if (!result.success) {
-    return { error: 'Invalid input', details: result.error.flatten() };
+    return { error: 'Invalid input', details: result.error.issues };
   }
 
   // 3. Authorized action
@@ -297,7 +299,7 @@ import { cache } from 'react';
 import { verifyToken } from './jwt';
 
 export const auth = cache(async () => {
-  const cookieStore = cookies();
+  const cookieStore = await cookies();
   const token = cookieStore.get('session')?.value;
 
   if (!token) return null;
@@ -380,7 +382,7 @@ export async function POST(request: NextRequest) {
   const result = createSchema.safeParse(body);
   if (!result.success) {
     return NextResponse.json(
-      { error: 'Validation failed', details: result.error.flatten() },
+      { error: 'Validation failed', details: result.error.issues },
       { status: 400 }
     );
   }
@@ -404,25 +406,27 @@ import { NextRequest, NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { db } from '@/lib/db';
 
-interface Params {
-  params: { id: string };
-}
-
-export async function DELETE(request: NextRequest, { params }: Params) {
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
   const session = await auth();
   if (!session) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  // params is a Promise in Next.js 15+ — must be awaited
+  const { id } = await params;
+
   // Validate ID format
-  if (!params.id || typeof params.id !== 'string') {
+  if (!id || typeof id !== 'string') {
     return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
   }
 
   // Delete with ownership check
   const deleted = await db.post.deleteMany({
     where: {
-      id: params.id,
+      id,
       userId: session.user.id,
     },
   });
@@ -439,12 +443,15 @@ export async function DELETE(request: NextRequest, { params }: Params) {
 
 ## Security Headers
 
-### next.config.js Headers
+### Security Headers via next.config.ts
 
-```js
-// next.config.js
-/** @type {import('next').NextConfig} */
-const nextConfig = {
+Next.js 15+ supports TypeScript config natively. Use `next.config.ts` for type-safe configuration.
+
+```ts
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
   async headers() {
     return [
       {
@@ -480,7 +487,7 @@ const nextConfig = {
   },
 };
 
-module.exports = nextConfig;
+export default nextConfig;
 ```
 
 ### Content Security Policy
@@ -506,19 +513,24 @@ export function middleware(request: NextRequest) {
     upgrade-insecure-requests;
   `.replace(/\s{2,}/g, ' ').trim();
 
-  const response = NextResponse.next();
+  // Set nonce on REQUEST headers (server-internal only — never exposed to network)
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set('x-nonce', nonce);
 
+  // Set CSP on RESPONSE headers (sent to browser)
+  const response = NextResponse.next({
+    request: { headers: requestHeaders },
+  });
   response.headers.set('Content-Security-Policy', cspHeader);
-  response.headers.set('x-nonce', nonce);
 
   return response;
 }
 
-// app/layout.tsx - Use nonce in scripts
+// app/layout.tsx - Read nonce from request headers
 import { headers } from 'next/headers';
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
-  const nonce = headers().get('x-nonce') ?? '';
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const nonce = (await headers()).get('x-nonce') ?? '';
 
   return (
     <html lang="en">
@@ -530,6 +542,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   );
 }
 ```
+
+> **Why request headers?** The nonce must reach Server Components (via `headers()`) but must never be exposed on the network. Setting it on request headers keeps it server-internal. Setting it on response headers would leak the nonce to any network observer, defeating the purpose of CSP nonce-based protection.
 
 ---
 
@@ -587,6 +601,320 @@ export const clientEnv = clientEnvSchema.parse({
   NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
 });
 ```
+
+---
+
+## Open Redirect Prevention
+
+Redirects based on user input are a common source of open redirect vulnerabilities.
+
+```tsx
+// ❌ BAD: Redirect to user-controlled URL
+import { redirect } from 'next/navigation';
+
+export default async function LoginPage({ searchParams }: {
+  searchParams: Promise<{ redirect?: string }>;
+}) {
+  const session = await auth();
+  const { redirect: redirectTo } = await searchParams;
+
+  if (session) {
+    redirect(redirectTo ?? '/dashboard'); // Open redirect!
+  }
+  // ...
+}
+
+// ✅ GOOD: Validate redirect is same-origin
+const SAFE_REDIRECT_PATTERN = /^\/[a-zA-Z0-9\-_/]*$/;
+
+function getSafeRedirect(url: string | undefined, fallback = '/dashboard'): string {
+  if (!url) return fallback;
+  // Only allow relative paths starting with /
+  // Block protocol-relative URLs (//evil.com), javascript:, data:, etc.
+  if (!SAFE_REDIRECT_PATTERN.test(url)) return fallback;
+  return url;
+}
+
+export default async function LoginPage({ searchParams }: {
+  searchParams: Promise<{ redirect?: string }>;
+}) {
+  const session = await auth();
+  const { redirect: redirectTo } = await searchParams;
+
+  if (session) {
+    redirect(getSafeRedirect(redirectTo));
+  }
+  // ...
+}
+```
+
+---
+
+## Taint API (Experimental)
+
+React's `taintObjectReference` and `taintUniqueValue` prevent secrets from accidentally reaching Client Components. This is a defense-in-depth layer on top of `server-only`.
+
+```tsx
+// lib/auth.ts
+import 'server-only';
+import { experimental_taintObjectReference as taintObjectReference } from 'react';
+
+export async function getFullUser(id: string) {
+  const user = await db.user.findUnique({ where: { id } });
+
+  // Prevent the full user object from being passed to a Client Component
+  taintObjectReference(
+    'Do not pass the full user object to Client Components. Select only the fields you need.',
+    user
+  );
+
+  return user;
+}
+
+// If a Server Component tries to pass this object as a prop to a Client Component,
+// React will throw an error with the message above.
+```
+
+> Enable in `next.config.ts` with `experimental: { taint: true }`. This is still experimental but provides strong protection against accidental secret leakage.
+
+---
+
+## Error Handling
+
+### Error Boundaries with error.tsx
+
+```tsx
+// app/dashboard/error.tsx
+'use client'; // Error boundaries must be Client Components
+
+export default function DashboardError({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  // NEVER show error.message to users in production — it may contain
+  // internal details (stack traces, SQL, file paths)
+  return (
+    <div role="alert">
+      <h2>Something went wrong</h2>
+      <p>An unexpected error occurred. Please try again.</p>
+      <button onClick={reset}>Try again</button>
+    </div>
+  );
+}
+
+// app/global-error.tsx — catches errors in the root layout
+'use client';
+
+export default function GlobalError({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  // Log error server-side only (via error reporting service)
+  // error.digest is a hash — safe to log or display for support reference
+  return (
+    <html>
+      <body>
+        <h2>Something went wrong</h2>
+        <p>Error reference: {error.digest}</p>
+        <button onClick={reset}>Try again</button>
+      </body>
+    </html>
+  );
+}
+```
+
+### Custom Not Found Page
+
+```tsx
+// app/not-found.tsx
+export default function NotFound() {
+  return (
+    <div>
+      <h2>Page Not Found</h2>
+      <p>The page you are looking for does not exist.</p>
+    </div>
+  );
+}
+```
+
+> Use `notFound()` from `next/navigation` to trigger the not-found page from Server Components or Server Actions when a resource doesn't exist. This prevents information leakage from 404 responses.
+
+---
+
+## CORS for API Routes
+
+Next.js does not set CORS headers by default. For API routes that accept cross-origin requests:
+
+```tsx
+// app/api/public/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+
+const ALLOWED_ORIGINS = [
+  'https://myapp.com',
+  'https://staging.myapp.com',
+];
+
+function getCorsHeaders(origin: string | null) {
+  // Only reflect allowed origins — never use '*' with credentials
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    return {
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Max-Age': '86400',
+    };
+  }
+  return {};
+}
+
+// Handle preflight
+export async function OPTIONS(request: NextRequest) {
+  const origin = request.headers.get('origin');
+  return new NextResponse(null, {
+    status: 204,
+    headers: getCorsHeaders(origin),
+  });
+}
+
+export async function GET(request: NextRequest) {
+  const origin = request.headers.get('origin');
+  const data = { message: 'Hello' };
+
+  return NextResponse.json(data, {
+    headers: getCorsHeaders(origin),
+  });
+}
+```
+
+> For routes that should only be called same-origin (most routes), do not add CORS headers. The browser's same-origin policy is your default protection.
+
+---
+
+## File Uploads in Route Handlers
+
+```tsx
+// app/api/upload/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { auth } from '@/lib/auth';
+
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+
+export async function POST(request: NextRequest) {
+  const session = await auth();
+  if (!session) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const formData = await request.formData();
+  const file = formData.get('file') as File | null;
+
+  if (!file) {
+    return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+  }
+
+  // Validate file size
+  if (file.size > MAX_FILE_SIZE) {
+    return NextResponse.json({ error: 'File too large' }, { status: 413 });
+  }
+
+  // Validate MIME type (check both the declared type AND magic bytes for images)
+  if (!ALLOWED_TYPES.includes(file.type)) {
+    return NextResponse.json({ error: 'File type not allowed' }, { status: 415 });
+  }
+
+  // Generate a safe filename — never use the original filename directly
+  const ext = file.type.split('/')[1];
+  const safeFilename = `${crypto.randomUUID()}.${ext}`;
+
+  // Upload to storage (S3, R2, etc.) — never write to the public/ directory
+  const buffer = Buffer.from(await file.arrayBuffer());
+  await uploadToStorage(safeFilename, buffer, file.type);
+
+  return NextResponse.json({ filename: safeFilename }, { status: 201 });
+}
+```
+
+> Never trust the client-provided filename — it can contain path traversal (`../../../etc/passwd`) or XSS payloads. Always generate a safe filename server-side.
+
+---
+
+## Cache Security
+
+### Preventing Sensitive Data in Shared Caches
+
+```tsx
+// ❌ BAD: User-specific data cached globally
+// app/dashboard/page.tsx
+export default async function Dashboard() {
+  // This page may be cached and served to other users!
+  const user = await getCurrentUser();
+  return <div>Balance: {user.balance}</div>;
+}
+
+// ✅ GOOD: Opt out of caching for user-specific pages
+import { unstable_noStore as noStore } from 'next/cache';
+
+export default async function Dashboard() {
+  noStore(); // Prevent caching — this page has user-specific data
+  const user = await getCurrentUser();
+  return <div>Balance: {user.balance}</div>;
+}
+```
+
+### Cache Key Isolation
+
+```tsx
+// ✅ GOOD: Use React cache() scoped to the request
+import { cache } from 'react';
+
+// This is per-request — different users get different results
+export const getCurrentUser = cache(async () => {
+  const session = await auth();
+  if (!session?.user?.id) return null;
+  return db.user.findUnique({ where: { id: session.user.id } });
+});
+```
+
+> `React.cache()` is request-scoped — it deduplicates within a single request but does not share across users. `fetch()` caching and `unstable_cache()` are shared across requests — never store user-specific data in them without a user-specific cache key.
+
+---
+
+## next/script with CSP Nonce
+
+When using third-party scripts with nonce-based CSP, pass the nonce to `<Script>`:
+
+```tsx
+// app/layout.tsx
+import Script from 'next/script';
+import { headers } from 'next/headers';
+
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const nonce = (await headers()).get('x-nonce') ?? '';
+
+  return (
+    <html lang="en">
+      <body>
+        {children}
+        {/* Third-party scripts need the nonce to execute under CSP */}
+        <Script
+          src="https://www.googletagmanager.com/gtag/js?id=G-XXXXX"
+          strategy="afterInteractive"
+          nonce={nonce}
+        />
+      </body>
+    </html>
+  );
+}
+```
+
+> Without the nonce, third-party scripts will be blocked by `script-src 'nonce-...' 'strict-dynamic'`. Always pass the nonce to every `<Script>` component.
 
 ---
 
@@ -649,7 +977,7 @@ import { cookies } from 'next/headers';
 import { revalidatePath } from 'next/cache';
 
 export async function logout() {
-  cookies().delete('session');
+  (await cookies()).delete('session');
   revalidatePath('/', 'layout'); // Clear all cached pages
 }
 ```
@@ -660,23 +988,37 @@ export async function logout() {
 
 | Purpose | Library | Why |
 |---------|---------|-----|
-| Auth | `next-auth` / `lucia` | Battle-tested, Next.js optimized |
+| Auth | `next-auth@5` (Auth.js) | Battle-tested, Next.js optimized. v5 is the App Router rewrite (rebranded as Auth.js) |
 | Validation | `zod` | TypeScript-first, runtime validation |
 | Rate Limiting | `@upstash/ratelimit` | Edge-compatible, serverless |
-| Database | `prisma` | Type-safe, good DX |
-| Encryption | `jose` | Edge-compatible JWT/JWE |
+| Database | `prisma` / `drizzle-orm` | Type-safe ORM with good DX |
+| Encryption | `jose` | Edge-compatible JWT/JWE/JWS |
+| Sanitization | `dompurify` + `isomorphic-dompurify` | XSS prevention for user HTML |
+| CSRF | Built-in | Server Actions include CSRF tokens automatically |
 
 ---
 
 ## Anti-Patterns
 
-1. **Client-side only auth** - Always verify on server
-2. **Passing full database objects to client** - Select specific fields
-3. **Hardcoded secrets in code** - Use environment variables
-4. **Skipping input validation in Server Actions** - Always validate with Zod
-5. **No ownership checks on mutations** - Always verify user owns resource
-6. **Using `eval()` or `dangerouslySetInnerHTML`** - Find alternatives
-7. **Exposing stack traces in production** - Use error boundaries
+| # | Anti-Pattern | Why It's Dangerous | Do This Instead |
+|---|---|---|---|
+| 1 | Client-side only auth checks | Data already sent to client before redirect | Verify auth in Server Components/middleware |
+| 2 | Passing full DB objects to Client Components | Leaks password hashes, internal IDs, PII | `select:` only the fields the UI needs |
+| 3 | Hardcoded secrets in source code | Committed to git, visible in client bundle | Use `process.env` (no `NEXT_PUBLIC_` prefix for secrets) |
+| 4 | Skipping validation in Server Actions | Server Actions are public HTTP endpoints | Always validate with Zod in every action |
+| 5 | No ownership checks on mutations | IDOR — any user can modify any resource | Include `userId: session.user.id` in every WHERE clause |
+| 6 | Dynamic code execution from user strings | XSS / remote code execution | Use structured data, sanitize HTML with DOMPurify |
+| 7 | Exposing error details to users | Stack traces reveal internals, DB schema, file paths | Use error.tsx with generic messages; log details server-side |
+| 8 | Setting CSP nonce on response headers | Leaks nonce to network, defeats CSP protection | Set nonce on request headers (server-internal only) |
+| 9 | Synchronous `cookies()`/`headers()` calls | Broken in Next.js 15+, removed in 16 | Always `await cookies()`, `await headers()` |
+| 10 | Redirecting to user-controlled URLs | Open redirect — phishing via your domain | Validate redirect is same-origin relative path |
+| 11 | Using original filename for uploads | Path traversal, XSS in filenames | Generate `crypto.randomUUID()` filenames server-side |
+| 12 | User-specific data in shared cache | Cache poisoning — user A sees user B's data | Use `noStore()` or user-scoped cache keys |
+| 13 | Server Action without auth check | Anyone can call it via POST request | Always authenticate as first step in every action |
+| 14 | Missing `server-only` on sensitive modules | Secrets may be bundled into client code | `import 'server-only'` in every file with secrets |
+| 15 | Using `NEXT_PUBLIC_` for sensitive values | Exposed in client bundle, visible in page source | Only use `NEXT_PUBLIC_` for truly public config |
+| 16 | No rate limiting on Server Actions | Brute force, spam, DoS | Use `@upstash/ratelimit` keyed by user ID or IP |
+| 17 | Missing CORS on public API routes | Either too open or missing preflight handling | Explicit origin allowlist, never `*` with credentials |
 
 ---
 
